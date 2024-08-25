@@ -1,34 +1,24 @@
+use std::str::FromStr;
 use std::time::Duration;
-use std::{borrow::Borrow, str::FromStr};
 
 use flex_error::DisplayError;
-use tendermint::{
-    block::Height,
-    evidence::{Evidence, LightClientAttackEvidence},
-    trust_threshold::TrustThresholdFraction,
-    Hash, Time,
-};
+use tendermint::{block::Height, trust_threshold::TrustThresholdFraction, Hash, Time};
 use tendermint_light_client::{
-    builder::LightClientBuilder,
     components::{
         clock::{Clock, FixedClock},
         io::{AtHeight, Io, IoError, ProdIo},
-        scheduler,
     },
     predicates::ProdPredicates,
     state::State,
-    store::{memory::MemoryStore, LightStore},
+    store::memory::MemoryStore,
     types::{LightBlock, PeerId},
     verifier::{
         options::Options, predicates::VerificationPredicates, types::Status, ProdVerifier, Verdict,
         Verifier,
     },
 };
-use tendermint_light_client_detector::{detect_divergence, Divergence, Provider};
 use tendermint_light_client_verifier::errors::VerificationErrorDetail;
 use tendermint_rpc as rpc;
-use tendermint_rpc::{Client, HttpClient};
-use tendermint_testgen::light_block;
 
 // [[chains]]
 // id = 'osmosis-1'
@@ -58,14 +48,6 @@ use tendermint_testgen::light_block;
 // ]
 
 // https://services.kjnodes.com/mainnet/osmosis/public-rpc/
-
-struct MockIo;
-
-impl Io for MockIo {
-    fn fetch_light_block(&self, _height: AtHeight) -> Result<LightBlock, IoError> {
-        unimplemented!()
-    }
-}
 
 use flex_error::define_error;
 
@@ -136,6 +118,111 @@ define_error! {
     }
 }
 
+pub struct CosmosRoute {
+    io: ProdIo,
+}
+
+impl CosmosRoute {
+    pub fn new(io: &ProdIo) -> Self {
+        Self { io: io.clone() }
+    }
+
+    pub fn fetch_light_block(&self, height: Height) -> Result<LightBlock, IoError> {
+        self.io.fetch_light_block(AtHeight::At(height))
+    }
+
+    pub fn latest_height(&self) -> Result<Height, IoError> {
+        let signed_header = self.io.fetch_signed_header(AtHeight::Highest)?;
+        Ok(Height::from(signed_header.header.height.value() as u32 - 1))
+    }
+
+    pub fn verify_to_highest(&self, light_client: &mut LightClient) -> Result<LightBlock, Error> {
+        let latest_height = self.latest_height().map_err(Error::io)?;
+
+        self.verify_to_target(latest_height, light_client)
+    }
+
+    pub fn verify_to_target(
+        &self,
+        target_height: Height,
+        light_client: &mut LightClient,
+    ) -> Result<LightBlock, Error> {
+        // Let's first look in the store to see whether
+        // we have already successfully verified this block.
+        if let Some(light_block) = light_client
+            .state
+            .light_store
+            .get_trusted_or_verified(target_height)
+        {
+            return Ok(light_block);
+        }
+
+        // Get the highest trusted state
+        let highest = light_client
+            .state
+            .light_store
+            .highest_trusted_or_verified_before(target_height)
+            .or_else(|| light_client.state.light_store.lowest_trusted_or_verified())
+            .ok_or_else(Error::no_initial_trusted_state)?;
+
+        if target_height >= highest.height() {
+            // Perform forward verification with bisection
+            self.verify_forward(target_height, light_client)
+        } else {
+            // Perform sequential backward verification
+            // self.verify_backward(target_height, state)
+
+            return Err(Error::target_lower_than_trusted_state(
+                target_height,
+                highest.height(),
+            ));
+        }
+    }
+
+    fn verify_forward(
+        &self,
+        target_height: Height,
+        light_client: &mut LightClient,
+    ) -> Result<LightBlock, Error> {
+        let mut current_height = target_height;
+
+        loop {
+            let current_block = self.fetch_light_block(current_height).map_err(Error::io)?;
+            let trusted_height =
+                light_client.verify_light_block(target_height, current_height, &current_block)?;
+            println!("new trusted height: {:?}", trusted_height);
+            if trusted_height == target_height {
+                // TODO
+                return Ok(current_block);
+            }
+
+            // Compute the next height to fetch and verify
+            current_height =
+                Self::basic_bisecting_schedule(trusted_height, current_height, target_height);
+        }
+    }
+    pub fn basic_bisecting_schedule(
+        trusted_height: Height,
+        current_height: Height,
+        target_height: Height,
+    ) -> Height {
+        if trusted_height == current_height {
+            // We can't go further back, so let's try to verify the target height again,
+            // hopefully we have enough trust in the store by now.
+            target_height
+        } else {
+            // Pick a midpoint H between `trusted_height <= H <= current_height`.
+            Self::midpoint(trusted_height, current_height)
+        }
+    }
+
+    fn midpoint(low: Height, high: Height) -> Height {
+        (low.value() + (high.value() + 1 - low.value()) / 2)
+            .try_into()
+            .unwrap() // Will panic if midpoint is higher than i64::MAX
+    }
+}
+
 pub struct LightClient {
     pub options: Options,
     pub clock: Box<dyn Clock>,
@@ -189,8 +276,122 @@ impl LightClient {
         Ok(())
     }
 
-    pub fn latest_trusted(&self) -> Option<LightBlock> {
-        self.state.light_store.highest(Status::Trusted)
+    pub fn highest_trusted_or_verified(&self) -> Option<LightBlock> {
+        self.state.light_store.highest_trusted_or_verified()
+    }
+
+    pub fn is_within_trust_period(
+        light_block: &LightBlock,
+        trusting_period: Duration,
+        now: Time,
+    ) -> bool {
+        let header_time = light_block.signed_header.header.time;
+        match now - trusting_period {
+            Ok(start) => header_time > start,
+            Err(_) => false,
+        }
+    }
+
+    pub fn verify_light_block(
+        &mut self,
+        target_height: Height,
+        current_height: Height,
+        current_block: &LightBlock,
+    ) -> Result<Height, Error> {
+        let mut current_block = current_block.clone();
+        let mut status = Status::Unverified;
+
+        let block = self.state.light_store.get_non_failed(current_height);
+
+        if let Some(block) = block {
+            current_block = block.0;
+            status = block.1;
+        } else {
+            self.state
+                .light_store
+                .insert(current_block.clone(), Status::Unverified);
+        }
+
+        let now = self.clock.now();
+
+        // Get the latest trusted state
+        let trusted_block = self
+            .state
+            .light_store
+            .highest_trusted_or_verified_before(target_height)
+            .ok_or_else(Error::no_initial_trusted_state)?;
+
+        if target_height < trusted_block.height() {
+            return Err(Error::target_lower_than_trusted_state(
+                target_height,
+                trusted_block.height(),
+            ));
+        }
+
+        // Check invariant [LCV-INV-TP.1]
+        if !Self::is_within_trust_period(&trusted_block, self.options.trusting_period, now) {
+            return Err(Error::trusted_state_outside_trusting_period(
+                Box::new(trusted_block),
+                self.options,
+            ));
+        }
+
+        // Log the current height as a dependency of the block at the target height
+        self.state.trace_block(target_height, current_height);
+
+        // If the trusted state is now at a height equal to the target height, we are done.
+        // [LCV-DIST-LIFE.1]
+        if target_height == trusted_block.height() {
+            return Ok(trusted_block.height());
+        }
+
+        // Validate and verify the current block
+        let verdict = self.verifier.verify_update_header(
+            current_block.as_untrusted_state(),
+            trusted_block.as_trusted_state(),
+            &self.options,
+            now,
+        );
+
+        match verdict {
+            Verdict::Success => {
+                // Verification succeeded, add the block to the light store with
+                // the `Verified` status or higher if already trusted.
+                let new_status = Status::most_trusted(Status::Verified, status);
+                self.state.light_store.update(&current_block, new_status);
+
+                // Log the trusted height as a dependency of the block at the current height
+                self.state
+                    .trace_block(current_height, trusted_block.height());
+            }
+            Verdict::Invalid(e) => {
+                // Verification failed, add the block to the light store with `Failed` status,
+                // and abort.
+                self.state
+                    .light_store
+                    .update(&current_block, Status::Failed);
+
+                return Err(Error::invalid_light_block_detail(e));
+            }
+            Verdict::NotEnoughTrust(_) => {
+                // The current block cannot be trusted because of a missing overlap in the
+                // validator sets. Add the block to the light store with
+                // the `Unverified` status. This will engage bisection in an
+                // attempt to raise the height of the highest trusted state
+                // until there is enough overlap.
+                self.state
+                    .light_store
+                    .update(&current_block, Status::Unverified);
+            }
+        }
+
+        let trusted_height = self
+            .state
+            .light_store
+            .highest_trusted_or_verified_before(target_height)
+            .map(|lb| lb.height())
+            .unwrap();
+        Ok(trusted_height)
     }
 }
 
@@ -205,6 +406,8 @@ fn main() -> Result<(), Error> {
     let peer_id = PeerId::from_str("c89fa4604b848ebe76004df5a698cb3ad9e4cfda").unwrap();
     let io = ProdIo::new(peer_id, rpc_client.clone(), None);
 
+    let route = CosmosRoute::new(&io);
+
     let options = Options {
         trust_threshold: TrustThresholdFraction::ONE_THIRD,
         trusting_period: Duration::from_secs(10 * 24 * 60 * 60),
@@ -217,172 +420,29 @@ fn main() -> Result<(), Error> {
         Box::new(ProdPredicates),
     );
 
-    //
-    let trusted_height = Height::from(19802391u32);
-    //
-    let trusted_state = io.fetch_light_block(AtHeight::At(trusted_height)).unwrap();
+    // route
+    let trusted_state = route.fetch_light_block(Height::from(19693151u32)).unwrap();
+    println!(
+        "trusted_state last_commit_hash: {:?}, data_hash: {:?}",
+        trusted_state.signed_header.header.last_commit_hash,
+        trusted_state.signed_header.header.data_hash
+    );
 
     light_client.validate(&trusted_state).unwrap();
     light_client
         .state
         .light_store
         .insert(trusted_state, Status::Trusted);
-    println!("{:?}", light_client.latest_trusted().unwrap().height());
+    println!(
+        "set trusted height: {:?}",
+        light_client.highest_trusted_or_verified().unwrap().height()
+    );
 
-    let signed_header = io.fetch_signed_header(AtHeight::Highest).unwrap();
-    let target_height = Height::from(signed_header.header.height.value() as u32 - 1);
-    println!("{:?}", target_height);
+    // route
+    let latest_height = route.latest_height().unwrap();
+    println!("latest_height: {:?}", latest_height);
+    let light_block = route.verify_to_highest(&mut light_client).unwrap();
+    println!("light_block height: {:?}", light_block.height());
 
-    let highest = light_client
-        .state
-        .light_store
-        .highest_trusted_or_verified_before(target_height)
-        .or_else(|| light_client.state.light_store.lowest_trusted_or_verified())
-        .ok_or_else(Error::no_initial_trusted_state)
-        .unwrap();
-
-    assert!(target_height >= highest.height());
-    // let scheduler = scheduler::basic_bisecting_schedule;
-    let mut current_height = target_height;
-
-    loop {
-        let now = light_client.clock.now();
-
-        // Get the latest trusted state
-        let trusted_block = light_client
-            .state
-            .light_store
-            .highest_trusted_or_verified_before(target_height)
-            .ok_or_else(Error::no_initial_trusted_state)
-            .unwrap();
-
-        if target_height < trusted_block.height() {
-            println!("0");
-            return Err(Error::target_lower_than_trusted_state(
-                target_height,
-                trusted_block.height(),
-            ));
-        }
-
-        // Check invariant [LCV-INV-TP.1]
-        if !is_within_trust_period(&trusted_block, light_client.options.trusting_period, now) {
-            println!("1");
-            return Err(Error::trusted_state_outside_trusting_period(
-                Box::new(trusted_block),
-                light_client.options,
-            ));
-        }
-
-        // Log the current height as a dependency of the block at the target height
-        light_client
-            .state
-            .trace_block(target_height, current_height);
-
-        // If the trusted state is now at a height equal to the target height, we are done.
-        // [LCV-DIST-LIFE.1]
-        if target_height == trusted_block.height() {
-            println!("2");
-            break;
-        }
-
-        // Fetch the block at the current height from the light store if already present,
-        // or from the primary peer otherwise.
-        let current_block = io.fetch_light_block(AtHeight::At(current_height)).unwrap();
-        println!("current_block: {:?}", current_block.height());
-
-        light_client
-            .state
-            .light_store
-            .insert(current_block.clone(), Status::Unverified);
-
-        // Validate and verify the current block
-        let verdict = light_client.verifier.verify_update_header(
-            current_block.as_untrusted_state(),
-            trusted_block.as_trusted_state(),
-            &light_client.options,
-            now,
-        );
-
-        println!("3: {:?}", verdict);
-
-        match verdict {
-            Verdict::Success => {
-                // Verification succeeded, add the block to the light store with
-                // the `Verified` status or higher if already trusted.
-                // let new_status = Status::most_trusted(Status::Verified, Status::Unverified);
-                let new_status = Status::Trusted;
-                light_client
-                    .state
-                    .light_store
-                    .update(&current_block, new_status);
-
-                // Log the trusted height as a dependency of the block at the current height
-                light_client
-                    .state
-                    .trace_block(current_height, trusted_block.height());
-            }
-            Verdict::Invalid(e) => {
-                // Verification failed, add the block to the light store with `Failed` status,
-                // and abort.
-                light_client
-                    .state
-                    .light_store
-                    .update(&current_block, Status::Failed);
-
-                return Err(Error::invalid_light_block_detail(e));
-            }
-            Verdict::NotEnoughTrust(_) => {
-                // The current block cannot be trusted because of a missing overlap in the
-                // validator sets. Add the block to the light store with
-                // the `Unverified` status. This will engage bisection in an
-                // attempt to raise the height of the highest trusted state
-                // until there is enough overlap.
-                light_client
-                    .state
-                    .light_store
-                    .update(&current_block, Status::Unverified);
-            }
-        }
-
-        println!(
-            "latest_trusted: {:?}",
-            light_client.latest_trusted().unwrap().height()
-        );
-        // Compute the next height to fetch and verify
-        current_height = basic_bisecting_schedule(current_height, trusted_block.height());
-    }
     Ok(())
-}
-
-pub fn is_within_trust_period(
-    light_block: &LightBlock,
-    trusting_period: Duration,
-    now: Time,
-) -> bool {
-    let header_time = light_block.signed_header.header.time;
-    match now - trusting_period {
-        Ok(start) => header_time > start,
-        Err(_) => false,
-    }
-}
-
-// #[requires(low <= high)]
-// #[ensures(low <= ret && ret <= high)]
-fn midpoint(low: Height, high: Height) -> Height {
-    (low.value() + (high.value() + 1 - low.value()) / 2)
-        .try_into()
-        .unwrap() // Will panic if midpoint is higher than i64::MAX
-}
-
-// #[requires(light_store.highest_trusted_or_verified().is_some())]
-// #[ensures(valid_schedule(ret, target_height, current_height, light_store))]
-pub fn basic_bisecting_schedule(current_height: Height, target_height: Height) -> Height {
-    if target_height == current_height {
-        // We can't go further back, so let's try to verify the target height again,
-        // hopefully we have enough trust in the store by now.
-        target_height
-    } else {
-        // Pick a midpoint H between `trusted_height <= H <= current_height`.
-        midpoint(target_height, current_height)
-    }
 }

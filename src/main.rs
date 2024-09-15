@@ -1,7 +1,25 @@
+use std::future::Future;
 use std::str::FromStr;
 use std::time::Duration;
 
+use base64;
+use cosmwasm_std::Binary;
 use flex_error::DisplayError;
+use flex_error::{define_error, TraceError};
+use ibc_proto::ibc::core::commitment::v1::MerkleProof as RawMerkleProof;
+use ics23::{
+    calculate_existence_root, verify_membership, verify_non_membership, CommitmentProof,
+    NonExistenceProof,
+};
+use osmosis_std::types::cosmwasm::wasm::v1::{
+    QueryCodeRequest, QueryRawContractStateRequest, QueryRawContractStateResponse,
+};
+use osmosis_std::types::tendermint::abci::ResponseQuery;
+use osmosis_std_derive::CosmwasmExt;
+use prost::DecodeError;
+use prost::Message;
+use std::sync::Arc;
+use tendermint::merkle::proof::ProofOps as TendermintProof;
 use tendermint::{block::Height, trust_threshold::TrustThresholdFraction, Hash, Time};
 use tendermint_light_client::{
     components::{
@@ -19,6 +37,65 @@ use tendermint_light_client::{
 };
 use tendermint_light_client_verifier::errors::VerificationErrorDetail;
 use tendermint_rpc as rpc;
+use tendermint_rpc::endpoint::abci_query::AbciQuery;
+use tendermint_rpc::Error as TendermintRpcError;
+use tendermint_rpc::{Client, HttpClient, Url};
+use tokio::runtime::Runtime as TokioRuntime;
+use bech32::{FromBase32, ToBase32};
+
+// pub const CONTRACT_STATE_PATH: &str = "/cosmwasm.wasm.v1.Query/Code";
+// pub const CONTRACT_STATE_PATH: &str = "/cosmwasm.wasm.v1.Query/RawContractState";
+pub const CONTRACT_STATE_PATH: &str = "/store/wasm/key";
+pub const CONTRACT_STORE_PREFIX: u8 = 0x03;
+// pub const IBC_QUERY_PATH: &str =
+//     "store/wasm/osmo16cdpze425guzfnm6av90vqh5ptd0apu4dxrpdhk7yry4kkh65l8qx57fe0";
+// $ ~/go/bin/osmosisd --node tcp://142.132.202.86:46657 query wasm contract-state raw osmo16cdpze425guzfnm6av90vqh5ptd0apu4dxrpdhk7yry4kkh65l8qx57fe0 contract_info --ascii
+// data: eyJjb250cmFjdCI6ImxldmFuYS5maW5hbmNlOm1hcmtldCIsInZlcnNpb24iOiIwLjEuMiJ9
+// {"contract":"levana.finance:market","version":"0.1.2"}
+
+// curl -X 'GET'   'https://rpc.osmosis.zone/abci_query?path=%22%2Fcosmwasm.wasm.v1.Query%2FRawContractState%22&data=0x0a3f6f736d6f31366364707a6534323567757a666e6d36617639307671683570746430617075346478727064686b37797279346b6b6836356c3871783537666530120d636f6e74726163745f696e666f&height=0&prove=false'   -H 'accept: application/json'
+// {"jsonrpc":"2.0","id":-1,"result":{"response":{"code":0,"log":"","info":"","index":"0","key":null,"value":"CjZ7ImNvbnRyYWN0IjoibGV2YW5hLmZpbmFuY2U6bWFya2V0IiwidmVyc2lvbiI6IjAuMS4yIn0=","proofOps":null,"height":"20197504","codespace":""}}}
+
+pub struct Height1 {
+    /// Previously known as "epoch"
+    revision_number: u64,
+
+    /// The height of a block
+    revision_height: u64,
+}
+
+pub enum QueryHeight {
+    Latest,
+    Specific(Height1),
+}
+
+#[derive(Debug)]
+pub struct QueryResponse {
+    pub value: Vec<u8>,
+    pub proof: Option<MerkleProof>,
+    pub height: Height,
+}
+
+#[derive(Debug)]
+pub struct MerkleProof {
+    pub proofs: Vec<CommitmentProof>,
+}
+
+impl From<RawMerkleProof> for MerkleProof {
+    fn from(proof: RawMerkleProof) -> Self {
+        Self {
+            proofs: proof.proofs,
+        }
+    }
+}
+
+impl From<MerkleProof> for RawMerkleProof {
+    fn from(proof: MerkleProof) -> Self {
+        Self {
+            proofs: proof.proofs,
+        }
+    }
+}
 
 // [[chains]]
 // id = 'osmosis-1'
@@ -48,8 +125,6 @@ use tendermint_rpc as rpc;
 // ]
 
 // https://services.kjnodes.com/mainnet/osmosis/public-rpc/
-
-use flex_error::define_error;
 
 use tendermint_light_client::verifier::errors::VerificationError;
 
@@ -115,6 +190,162 @@ define_error! {
             [ DisplayError<VerificationErrorDetail> ]
             | _ | { "invalid light block" },
 
+        Rpc
+            { url: tendermint_rpc::Url }
+            [ TendermintRpcError ]
+            |e| { format!("RPC error to endpoint {}", e.url) },
+
+        AbciQuery
+            { query: AbciQuery }
+            |e| { format!("ABCI query returned an error: {:?}", e.query) },
+
+        EmptyResponseProof
+            |_| { "empty response proof" },
+
+        InvalidRawMerkleProof
+            [ TraceError<DecodeError> ]
+            |_| { "invalid raw merkle proof" },
+
+        CommitmentProofDecodingFailed
+            [ TraceError<DecodeError> ]
+            |_| { "failed to decode commitment proof" },
+
+        EmptyCommitmentPrefix
+            |_| { "empty commitment prefix" },
+
+        EmptyMerkleProof
+            |_| { "empty merkle proof" },
+
+        EmptyMerkleRoot
+            |_| { "empty merkle root" },
+
+        EmptyVerifiedValue
+            |_| { "empty verified value" },
+
+        NumberOfSpecsMismatch
+            |_| { "mismatch between the number of proofs with that of specs" },
+
+        NumberOfKeysMismatch
+            |_| { "mismatch between the number of proofs with that of keys" },
+
+        InvalidMerkleProof
+            |_| { "invalid merkle proof" },
+
+        VerificationFailure
+            |_| { "proof verification failed" }
+    }
+}
+
+pub struct CosmosSdkChain {
+    // config: config::CosmosSdkConfig,
+    pub rpc_client: HttpClient,
+    rpc_addr: String,
+    // compat_mode: CompatMode,
+    // grpc_addr: Uri,
+    rt: Arc<TokioRuntime>,
+}
+
+impl CosmosSdkChain {
+    fn new() -> Self {
+        let rpc_addr = "http://142.132.202.86:46657";
+        let mut rpc_client = HttpClient::builder(rpc_addr.try_into().unwrap())
+            .build()
+            .unwrap();
+        // rpc_client.set_compat_mode(compat_mode);
+        let rt = Arc::new(TokioRuntime::new().unwrap());
+        Self {
+            rpc_client,
+            rpc_addr: rpc_addr.to_string(),
+            rt,
+        }
+    }
+
+    fn block_on<F: Future>(&self, f: F) -> F::Output {
+        self.rt.block_on(f)
+    }
+
+    fn query(
+        &self,
+        data: Vec<u8>,
+        height_query: Height,
+        prove: bool,
+    ) -> Result<QueryResponse, Error> {
+        let response = self.block_on(Self::abci_query(
+            &self.rpc_client,
+            &Url::from_str(&self.rpc_addr).unwrap(),
+            CONTRACT_STATE_PATH.to_string(),
+            data,
+            height_query,
+            prove,
+        ))?;
+
+        // TODO: Verify response proof, if requested.
+
+        Ok(response)
+    }
+
+    pub async fn abci_query(
+        rpc_client: &HttpClient,
+        rpc_address: &Url,
+        path: String,
+        data: Vec<u8>,
+        height: Height,
+        prove: bool,
+    ) -> Result<QueryResponse, Error> {
+        let height = if height.value() == 0 {
+            None
+        } else {
+            Some(height)
+        };
+
+        println!("path: {:?}", path);
+        println!("data: {:?}", hex::encode(data.clone()));
+        // Use the Tendermint-rs RPC client to do the query.
+        let response = rpc_client
+            .abci_query(Some(path), data, height, prove)
+            .await
+            .map_err(|e| Error::rpc(rpc_address.clone(), e))?;
+
+        if !response.code.is_ok() {
+            // Fail with response log.
+            return Err(Error::abci_query(response));
+        }
+        println!("response: {:?}", response);
+
+        if prove && response.proof.is_none() {
+            // Fail due to empty proof
+            return Err(Error::empty_response_proof());
+        }
+
+        let proof = response
+            .proof
+            .map(|p| Self::convert_tm_to_ics_merkle_proof(&p))
+            .transpose()?;
+
+        let response = QueryResponse {
+            value: response.value,
+            height: response.height,
+            proof,
+        };
+
+        Ok(response)
+    }
+
+    pub fn convert_tm_to_ics_merkle_proof(
+        tm_proof: &TendermintProof,
+    ) -> Result<MerkleProof, Error> {
+        let mut proofs = Vec::new();
+
+        for op in &tm_proof.ops {
+            let mut parsed = CommitmentProof { proof: None };
+
+            prost::Message::merge(&mut parsed, op.data.as_slice())
+                .map_err(Error::commitment_proof_decoding_failed)?;
+
+            proofs.push(parsed);
+        }
+
+        Ok(MerkleProof::from(RawMerkleProof { proofs }))
     }
 }
 
@@ -395,54 +626,88 @@ impl LightClient {
     }
 }
 
+fn bech32(bech32_address: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    // Decode the bech32 address
+    let (_, data, _) = bech32::decode(bech32_address)?;
+    
+    // Convert the data to bytes
+    let decoded = Vec::<u8>::from_base32(&data)?;
+    
+    Ok(decoded)
+}
+
 fn main() -> Result<(), Error> {
     println!("Hello, world!");
 
     // $ ~/go/bin/osmosisd status --node tcp://178.63.130.196:26657
     // {"NodeInfo":{"protocol_version":{"p2p":"8","block":"11","app":"0"},"id":"c1023ca3f1f17f69fb01146e6b10f686a838d678","listen_addr":"tcp://0.0.0.0:26656","network":"osmosis-1","version":"0.37.4","channels":"40202122233038606100","moniker":"osmosis","other":{"tx_index":"on","rpc_address":"tcp://0.0.0.0:26657"}},"SyncInfo":{"latest_block_hash":"C78BE0B00776CD49F1F1724F6153C7EE6EC635AD78DCB6BC9FF1F39639D4D253","latest_app_hash":"E809B2EC4FEF97BF2AC86DABFB4DBB0BE945DCF151BD885EC66D1D5D8034835B","latest_block_height":"19802391","latest_block_time":"2024-08-24T15:19:26.477987149Z","earliest_block_hash":"C8DC787FAAE0941EF05C75C3AECCF04B85DFB1D4A8D054A463F323B0D9459719","earliest_app_hash":"E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855","earliest_block_height":"1","earliest_block_time":"2021-06-18T17:00:00Z","catching_up":false},"ValidatorInfo":{"Address":"9648374F6970E7B04ADAC786CC2968A5F5452516","PubKey":{"type":"tendermint/PubKeyEd25519","value":"f0U47TWGpKcyIAzSIwzCHLZIJXHSq8DjWp9+t8QERh8="},"VotingPower":"0"}}
-    let rpc_client = rpc::HttpClient::builder("http://178.63.142.152:26657".try_into().unwrap())
-        .build()
-        .unwrap();
-    let peer_id = PeerId::from_str("c89fa4604b848ebe76004df5a698cb3ad9e4cfda").unwrap();
-    let io = ProdIo::new(peer_id, rpc_client.clone(), None);
+    // let rpc_client = rpc::HttpClient::builder("http://142.132.202.86:46657".try_into().unwrap())
+    //     .build()
+    //     .unwrap();
+    // let peer_id = PeerId::from_str("c89fa4604b848ebe76004df5a698cb3ad9e4cfda").unwrap();
+    // let io = ProdIo::new(peer_id, rpc_client.clone(), None);
 
-    let route = CosmosRoute::new(&io);
+    // let route = CosmosRoute::new(&io);
 
-    let options = Options {
-        trust_threshold: TrustThresholdFraction::ONE_THIRD,
-        trusting_period: Duration::from_secs(10 * 24 * 60 * 60),
-        clock_drift: Duration::from_secs(20),
-    };
+    // let options = Options {
+    //     trust_threshold: TrustThresholdFraction::ONE_THIRD,
+    //     trusting_period: Duration::from_secs(10 * 24 * 60 * 60),
+    //     clock_drift: Duration::from_secs(20),
+    // };
 
-    let mut light_client = LightClient::new(
-        options,
-        Box::<ProdVerifier>::default(),
-        Box::new(ProdPredicates),
-    );
+    // let mut light_client = LightClient::new(
+    //     options,
+    //     Box::<ProdVerifier>::default(),
+    //     Box::new(ProdPredicates),
+    // );
 
-    // route
-    let trusted_state = route.fetch_light_block(Height::from(19693151u32)).unwrap();
-    println!(
-        "trusted_state last_commit_hash: {:?}, data_hash: {:?}",
-        trusted_state.signed_header.header.last_commit_hash,
-        trusted_state.signed_header.header.data_hash
-    );
+    // // route
+    // let trusted_state = route.fetch_light_block(Height::from(19693151u32)).unwrap();
+    // println!(
+    //     "trusted_state last_commit_hash: {:?}, data_hash: {:?}",
+    //     trusted_state.signed_header.header.last_commit_hash,
+    //     trusted_state.signed_header.header.data_hash
+    // );
 
-    light_client.validate(&trusted_state).unwrap();
-    light_client
-        .state
-        .light_store
-        .insert(trusted_state, Status::Trusted);
-    println!(
-        "set trusted height: {:?}",
-        light_client.highest_trusted_or_verified().unwrap().height()
-    );
+    // light_client.validate(&trusted_state).unwrap();
+    // light_client
+    //     .state
+    //     .light_store
+    //     .insert(trusted_state, Status::Trusted);
+    // println!(
+    //     "set trusted height: {:?}",
+    //     light_client.highest_trusted_or_verified().unwrap().height()
+    // );
 
-    // route
-    let latest_height = route.latest_height().unwrap();
-    println!("latest_height: {:?}", latest_height);
-    let light_block = route.verify_to_highest(&mut light_client).unwrap();
-    println!("light_block height: {:?}", light_block.height());
+    // // route
+    // let latest_height = route.latest_height().unwrap();
+    // println!("latest_height: {:?}", latest_height);
+    // let light_block = route.verify_to_highest(&mut light_client).unwrap();
+    // println!("light_block height: {:?}", light_block.height());
+    let chain = CosmosSdkChain::new();
+    // let request = QueryRawContractStateRequest {
+    //     address: "osmo16cdpze425guzfnm6av90vqh5ptd0apu4dxrpdhk7yry4kkh65l8qx57fe0".to_string(),
+    //     query_data: b"contract_info".to_vec(),
+    //     // query_data: hex::decode("0002616D0000000000000043").unwrap(),
+    // };
+    // let data = request.to_proto_bytes();
+    // println!("data: {:?}", hex::encode(data.clone()));
+
+    let bech32_address = "osmo16cdpze425guzfnm6av90vqh5ptd0apu4dxrpdhk7yry4kkh65l8qx57fe0";
+    let address = bech32(bech32_address).unwrap();
+    // println!("Hex address: {}", hex_address);
+    let mut data = Vec::new();
+    data.push(CONTRACT_STORE_PREFIX);
+    data.extend_from_slice(&address);
+    data.extend_from_slice(b"contract_info");
+
+    println!("Query data: {}", hex::encode(&data));
+
+
+    let response = chain.query(data, Height::try_from(0u64).unwrap(), true)?;
+    /// let res = ResponseQuery::try_from(Binary::from(response.value)).unwrap();
+    // let res = QueryRawContractStateResponse::try_from(Binary::from(response.value)).unwrap();
+    println!("response: {:?}", response);
 
     Ok(())
 }

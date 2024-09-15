@@ -14,3 +14,13 @@ tendermint-proto = { version = "0.38.1" }
 tendermint-rpc = { version = "0.38.1" }
 tendermint-testgen = { version = "0.38.1" }
 flex-error = { version = "0.4.4", default-features = false }
+tokio = "1.39.2"
+ics23 = "0.12.0"
+prost = "0.13"
+ibc-proto = "0.47.0"
+osmosis-std = "0.25.0"
+cosmwasm-std = "1.1.2"
+hex = "0.4"
+base64 = "0.13"
+osmosis-std-derive = "0.20.1"
+bech32 = "0.9.1"
